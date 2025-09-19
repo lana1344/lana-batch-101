@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Batch Fargate Compute Environment'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the compute environment will be created
+    Default: vpc-04ef49f6455cd32b9
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs where the compute environment will launch instances
+    Default: "subnet-004543c70f3124880,subnet-07fb107b05cc4f4f6"
+  
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security Group IDs to attach to instances
+    Default: "sg-051abebf86a637480"
+
+Resources:
+  # S3 Bucket for workshop
+  BatchWorkshopBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'lana-batch-101-${AWS::AccountId}-${AWS::Region}'
+
+  # ECR Repository
+  MakeGifRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: lana-batch-101-make-gif
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+
+  # IAM Policy for resource access
+  BatchResourceAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: lana-batch-101-resource-access-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !Sub '${BatchWorkshopBucket.Arn}/*'
+              - !GetAtt BatchWorkshopBucket.Arn
+          - Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:PutImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - codebuild:CreateReportGroup
+              - codebuild:CreateReport
+              - codebuild:UpdateReport
+              - codebuild:BatchPutTestCases
+            Resource: '*'
+
+  # IAM Role for Batch jobs and CodeBuild
+  BatchResourceAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lana-batch-101-resource-access-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - codebuild.amazonaws.com
+      ManagedPolicyArns:
+        - !Ref BatchResourceAccessPolicy
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # CodeBuild project for building Docker image
+  MakeGifCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: MakeGifRepository
+    Properties:
+      Name: lana-lana-batch-101
+      ServiceRole: !GetAtt BatchResourceAccessRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: IMAGE_REPO_NAME
+            Value: !Ref MakeGifRepository
+          - Name: IMAGE_TAG
+            Value: latest
+      Source:
+        Type: S3
+        Location: !Sub '${BatchWorkshopBucket}/make-gif.zip'
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker image...
+                - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+
+  BatchComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ComputeEnvironmentName: learn-awsbatch-ce
+      Type: MANAGED
+      State: ENABLED
+      ComputeResources:
+        Type: FARGATE
+        MaxvCpus: 50
+        Subnets: !Ref SubnetIds
+        SecurityGroupIds: !Ref SecurityGroupIds
+
+  BatchJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: lana-batch-101-jq
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref BatchComputeEnvironment
+
+  # Job Definition 1: Copy images to S3 bucket
+  CopyToS3JobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: copy-to-s3
+      Type: container
+      PlatformCapabilities:
+        - FARGATE
+      Parameters:
+        Source: "NULL"
+        Destination: "NULL"
+      ContainerProperties:
+        Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${MakeGifRepository}:latest'
+        JobRoleArn: !GetAtt BatchResourceAccessRole.Arn
+        ExecutionRoleArn: !GetAtt BatchResourceAccessRole.Arn
+        ResourceRequirements:
+          - Type: VCPU
+            Value: "1"
+          - Type: MEMORY
+            Value: "2048"
+        NetworkConfiguration:
+          AssignPublicIp: ENABLED
+        FargatePlatformConfiguration:
+          PlatformVersion: "LATEST"
+        Command:
+          - copy-to-s3.sh
+          - "Ref::Source"
+          - "Ref::Destination"
+
+  # Job Definition 2: Make GIF from source images
+  MakeGifJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: make-gif
+      Type: container
+      PlatformCapabilities:
+        - FARGATE
+      Parameters:
+        Source: "NULL"
+        Destination: "NULL"
+      ContainerProperties:
+        Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${MakeGifRepository}:latest'
+        JobRoleArn: !GetAtt BatchResourceAccessRole.Arn
+        ExecutionRoleArn: !GetAtt BatchResourceAccessRole.Arn
+        ResourceRequirements:
+          - Type: VCPU
+            Value: "1"
+          - Type: MEMORY
+            Value: "2048"
+        NetworkConfiguration:
+          AssignPublicIp: ENABLED
+        FargatePlatformConfiguration:
+          PlatformVersion: "LATEST"
+        Command:
+          - make-gif.sh
+          - "Ref::Source"
+          - "Ref::Destination"
+
+Outputs:
+  ComputeEnvironmentArn:
+    Description: ARN of the Batch compute environment
+    Value: !Ref BatchComputeEnvironment
+  
+  JobQueueArn:
+    Description: ARN of the Batch job queue
+    Value: !Ref BatchJobQueue
+
+  BatchWorkshopBucketName:
+    Description: Name of the S3 bucket for workshop
+    Value: !Ref BatchWorkshopBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BatchWorkshopBucket'
+
+  ECRRepositoryUri:
+    Description: URI of the ECR repository
+    Value: !GetAtt MakeGifRepository.RepositoryUri
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRRepositoryUri'
+
+  ECRRepositoryName:
+    Description: Name of the ECR repository
+    Value: !Ref MakeGifRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRRepositoryName'
+
+  IAMRoleArn:
+    Description: ARN of the IAM role for resource access
+    Value: !GetAtt BatchResourceAccessRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  IAMRoleName:
+    Description: Name of the IAM role for resource access
+    Value: !Ref BatchResourceAccessRole
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleName'
+
+  IAMPolicyArn:
+    Description: ARN of the IAM policy for resource access
+    Value: !Ref BatchResourceAccessPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMPolicyArn'
+
+  CodeBuildProjectArn:
+    Description: ARN of the CodeBuild project for building Docker images
+    Value: !GetAtt MakeGifCodeBuildProject.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildProjectArn'
+
+  CodeBuildProjectName:
+    Description: Name of the CodeBuild project for building Docker images
+    Value: !Ref MakeGifCodeBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildProjectName'
+
+  CopyToS3JobDefinitionArn:
+    Description: ARN of the copy-to-s3 job definition
+    Value: !Ref CopyToS3JobDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-CopyToS3JobDefinitionArn'
+
+  MakeGifJobDefinitionArn:
+    Description: ARN of the make-gif job definition
+    Value: !Ref MakeGifJobDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-MakeGifJobDefinitionArn'
